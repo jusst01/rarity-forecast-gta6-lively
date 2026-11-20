@@ -47,7 +47,7 @@ GROWTH = 3868.0 / 638.0       # disclosed launch-refresh tracked-player growth f
 PIN_AT = 99.99
 PINNED = [99.0, 99.9, 100.0, 100.0, 100.0]
 
-BANDS = [(0.0, 1.0), (1.0, 10.0), (10.0, 50.0), (50.0, 100.0001)]
+BANDS = [(0.0, 1.0), (1.0, 10.0), (10.0, 50.0), (50.0, 100.0)]
 
 
 # --------------------------------------------------------------------------- #
@@ -258,9 +258,14 @@ def mixture_quantile(level, mu1, s1, w1, mu2, s2):
 
 
 def flat_row(rate, players):
-    """Dilute a flat history across the known 638 -> 3,868 player refresh."""
-    n_last = players if players > 0 else 638.0
-    earners = count_round(float(rate) / 100.0 * n_last)
+    """Dilute a flat history across the known 638 -> 3,868 player refresh.
+
+    N_last is the last event's player count exactly as read. When it is
+    non-positive the implied earner count is zero, so the diluted rate takes
+    the 0.02 floor (the spec has no substitute player count).
+    """
+    n_last = float(players)
+    earners = count_round(float(rate) / 100.0 * n_last) if n_last > 0.0 else 0
     diluted = 100.0 * earners / (n_last * GROWTH) if earners > 0 else 0.02
     mu1 = logit_pct(diluted)
     mu2 = logit_pct(max(float(rate), 0.05))
@@ -273,7 +278,8 @@ def flat_row(rate, players):
 # LIVE branch - saturating log-time fits
 # --------------------------------------------------------------------------- #
 def band_of(rate):
-    r = float(rate)
+    """Last-rate band of the shrinkage group; rates clamp into [0, 100] first."""
+    r = clamp(float(rate), 0.0, 100.0)
     for lo, hi in BANDS:
         if lo <= r < hi:
             return (lo, hi)
@@ -317,7 +323,8 @@ def live_context(events, trophies, horizon_minutes):
         rsd = math.sqrt(sum(r * r for r in resid) / len(resid)) if resid else 0.12
         rsd_by_trophy[i] = clamp(rsd, 0.12, 0.6)
 
-    # Group by (tier, last-rate band); a missing group falls back to the global median.
+    # Group by (tier, last-rate band); a missing group falls back to the global median,
+    # taken over the same non-pinned trophies that populate the groups.
     groups = {}
     for i, trophy in enumerate(trophies):
         rates = [ev["rates"][i] if i < len(ev["rates"]) else 0.0 for ev in events]
@@ -325,7 +332,8 @@ def live_context(events, trophies, horizon_minutes):
             continue
         key = (trophy.get("tier") if isinstance(trophy, dict) else None, band_of(rates[-1]))
         groups.setdefault(key, []).append(raw_slopes[i])
-    global_median = median(list(raw_slopes.values())) if raw_slopes else 0.0
+    pooled = [slope for slopes in groups.values() for slope in slopes]
+    global_median = median(pooled) if pooled else 0.0
 
     return {
         "x_last": x_last, "x_tgt": x_tgt, "horizon_days": horizon_days, "lam": lam,
@@ -391,6 +399,14 @@ def live_rows(events, trophies, horizon_minutes, case):
     return rows
 
 
+def use_flat_branch(events):
+    """Regime gate: FLAT with fewer than two events or a single player count."""
+    if len(events) < 2:
+        return True
+    first = events[0]["players"]
+    return all(ev["players"] == first for ev in events[1:])
+
+
 # --------------------------------------------------------------------------- #
 # Validation and finalisation
 # --------------------------------------------------------------------------- #
@@ -421,12 +437,96 @@ def validate(rows, case):
 
 
 def finalize(rows):
-    """Round to 4 decimals, clamp, sort; emit the contract's dict."""
-    clean = []
-    for row in rows:
-        q = sorted(rhu(clamp(float(v), 0.0, 100.0)) for v in row["q"])
-        clean.append({"id": row["id"], "q": q})
-    return {"trophies": clean}
+    """Round to 4 decimals, clamp, sort; emit the contract's dict.
+
+    Rounding is monotone, so sorted rows stay non-decreasing. If the encoded
+    result would exceed the 65,536-byte contract, precision steps down to 2, 1
+    and 0 decimals rather than dropping any trophy row.
+    """
+    for places in (4, 2, 1, 0):
+        clean = []
+        for row in rows:
+            q = sorted(rhu(clamp(float(v), 0.0, 100.0), places) for v in row["q"])
+            clean.append({"id": row["id"], "q": q})
+        out = {"trophies": clean}
+        if len(json.dumps(out, separators=(",", ":")).encode("utf-8")) <= 65536:
+            return out
+    return out
+
+
+def salvage_trophies(text):
+    """Best-effort recovery of the `trophies` array from a malformed case file.
+
+    A truncated write usually leaves the trophies array intact while the
+    history is cut off, so scan for the array's brackets (string-aware) and
+    parse just that slice. Returns a list, or None when nothing usable exists.
+    """
+    try:
+        key = text.find('"trophies"')
+        if key < 0:
+            return None
+        start = text.find("[", key)
+        if start < 0:
+            return None
+        depth = 0
+        in_str = False
+        esc = False
+        for pos in range(start, len(text)):
+            ch = text[pos]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    parsed = json.loads(text[start:pos + 1])
+                    return parsed if isinstance(parsed, list) else None
+        return None
+    except Exception:
+        return None
+
+
+def salvage_horizon(text):
+    """Best-effort horizon_minutes from a malformed case file; 0.0 when absent."""
+    try:
+        marker = text.find('"horizon_minutes"')
+        if marker < 0:
+            return 0.0
+        colon = text.find(":", marker)
+        if colon < 0:
+            return 0.0
+        token = ""
+        for ch in text[colon + 1:colon + 40]:
+            if ch in "-+.0123456789eE":
+                token += ch
+            elif token:
+                break
+            elif not ch.isspace():
+                break
+        value = float(token)
+        return value if math.isfinite(value) and value > 0.0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def fallback_output(case):
+    """Persistence output for a case whose forecast could not be computed."""
+    try:
+        forecast = finalize(persist_rows(case))
+        if isinstance(forecast.get("trophies"), list) and forecast["trophies"]:
+            return forecast
+    except Exception:
+        pass
+    return {"trophies": []}
 
 
 # --------------------------------------------------------------------------- #
@@ -451,9 +551,8 @@ def forecast_case(case, name):
         horizon = max(0.0, horizon)
 
         events = eventize(history)
-        players_seen = {ev["players"] for ev in events}
 
-        if len(events) < 2 or len(players_seen) <= 1:
+        if use_flat_branch(events):
             # FLAT branch: count-consistent dilution.
             last = events[-1] if events else {"players": 0.0, "rates": []}
             n_last = last["players"]
@@ -498,22 +597,35 @@ def main():
     # Every case file in name order, so two runs write identical bytes.
     for path in sorted(INPUT_DIR.glob("*.in")):
         try:
-            case = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+            text = path.read_text(encoding="utf-8", errors="replace")
         except Exception:
             continue
-        if not isinstance(case, dict):
-            continue
+        case = None
         try:
-            forecast = forecast_case(case, path.stem)
+            case = json.loads(text)
         except Exception:
-            # Malformed case: still emit a persistence output when trophies are readable.
+            case = None
+
+        if isinstance(case, dict):
             try:
-                forecast = finalize(persist_rows(case))
+                forecast = forecast_case(case, path.stem)
             except Exception:
-                forecast = {"trophies": []}
-        (OUTPUT_DIR / (path.stem + ".out")).write_text(
-            json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8"
-        )
+                # Malformed case: still emit a persistence output when trophies are readable.
+                forecast = fallback_output(case)
+        else:
+            # Unparseable file: salvage the trophy list so the case still gets rows.
+            trophies = salvage_trophies(text)
+            if trophies is None:
+                continue
+            case = {"trophies": trophies, "history": [], "horizon_minutes": salvage_horizon(text)}
+            forecast = fallback_output(case)
+
+        try:
+            (OUTPUT_DIR / (path.stem + ".out")).write_text(
+                json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8"
+            )
+        except Exception:
+            continue
 
 
 if __name__ == "__main__":
